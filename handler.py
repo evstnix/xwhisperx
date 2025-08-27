@@ -1,6 +1,7 @@
 # /src/handler.py
 # Pro-mode: faster-whisper (ASR with full decoder control) + WhisperX alignment (word/char)
-import os, json, base64, tempfile, time, math
+
+import os, json, base64, tempfile, time
 import runpod
 import requests
 
@@ -23,15 +24,15 @@ def _lazy_imports():
     return _torch, _whisperx, _FWClass
 
 # -------- config / env --------
-FORCE_DEVICE    = os.getenv("FORCE_DEVICE", "auto")   # auto|cuda|cpu
+FORCE_DEVICE    = os.getenv("FORCE_DEVICE", "auto")        # auto|cuda|cpu
 DEFAULT_MODEL   = os.getenv("MODEL_NAME", "large-v3")
-DEFAULT_BATCH   = int(os.getenv("BATCH_SIZE", "8"))   # (в FW .transcribe не используем)
-DEFAULT_COMPUTE = os.getenv("COMPUTE_TYPE", "float16")  # float16 на GPU, int8 на CPU
+DEFAULT_BATCH   = int(os.getenv("BATCH_SIZE", "8"))        # (в FW .transcribe не используем)
+DEFAULT_COMPUTE = os.getenv("COMPUTE_TYPE", "float16")     # float16 на GPU, int8 на CPU
 HF_TOKEN_ENV    = os.getenv("HF_TOKEN")
 HF_HOME         = os.getenv("HF_HOME", "/root/.cache/huggingface")
 WHISPER_CACHE   = os.getenv("WHISPER_CACHE", "/root/.cache/whisper")
 
-# Разрешённые kwargs для faster-whisper .transcribe(...)
+# allowed kwargs for faster-whisper .transcribe(...)
 ALLOWED_FW_ARGS = {
     "beam_size","best_of","patience","length_penalty","temperature",
     "compression_ratio_threshold","log_prob_threshold","no_speech_threshold",
@@ -100,8 +101,7 @@ def _ensure_fw_model(model_name, compute_type):
         _fw_cfg.get("device") != dev
     )
     if changed:
-        _fw_model = FW(model_name, device=dev, compute_type=ctype,
-                       download_root=WHISPER_CACHE)
+        _fw_model = FW(model_name, device=dev, compute_type=ctype, download_root=WHISPER_CACHE)
         _fw_cfg = {"name": model_name, "ctype": ctype, "device": dev}
     return _fw_model
 
@@ -115,9 +115,7 @@ def _ensure_aligner(lang_code, model_name=None):
         _align_cfg.get("lang") != lang_code or
         (model_name and _align_cfg.get("model_name") != model_name)
     ):
-        _align_model, _align_meta = wx.load_align_model(
-            language_code=lang_code, device=dev, model_name=model_name
-        )
+        _align_model, _align_meta = wx.load_align_model(language_code=lang_code, device=dev, model_name=model_name)
         _align_cfg = {"lang": lang_code, "model_name": model_name}
     return _align_model, _align_meta
 
@@ -156,25 +154,16 @@ def _log_versions_once():
         print(f"[versions] torch=? err={e}")
     os.environ["VER_LOGGED"] = "1"
 
-def _preload_once():
-    if os.environ.get("PRELOADED"):
-        return
-    _ensure_fw_model(os.getenv("MODEL_NAME", "large-v3"), os.getenv("COMPUTE_TYPE", "float16"))
-    for lang in (os.getenv("PRELOAD_LANGS","ru").split()):
-        _ensure_aligner(lang)
-    os.environ["PRELOADED"] = "1"
-
 # -------- main handler --------
 def handler(job):
     _log_versions_once()
-    if os.getenv("PRELOAD","1") == "1":
-        _preload_once()
 
     t0 = time.time()
     p = job.get("input", {})
 
     model_name   = p.get("model", DEFAULT_MODEL)
-    batch_size   = int(p.get("batch_size", DEFAULT_BATCH))  # (не используется FW, но оставили для совместимости API)
+    # batch_size есть в API, но в FW .transcribe не используется
+    batch_size   = int(p.get("batch_size", DEFAULT_BATCH))
     compute_type = p.get("compute_type", DEFAULT_COMPUTE)
 
     language     = p.get("language")           # "ru" и т.п.
@@ -183,7 +172,7 @@ def handler(job):
     diarize      = bool(p.get("diarize", False))
     hf_token     = p.get("hf_token") or HF_TOKEN_ENV
 
-    align_model_name = p.get("align_model")    # явный HF aligner
+    align_model_name = p.get("align_model")    # явный HF aligner (опц.)
     return_raw  = bool(p.get("return_raw", True))
     return_srt  = bool(p.get("return_srt", True))
     return_vtt  = bool(p.get("return_vtt", False))
@@ -214,9 +203,8 @@ def handler(job):
 
     detected_lang = info.language or language
 
-    # Если потребуется align или diarize — загрузим аудио через whisperX (16k, float32)
-    audio_wx = None
-    wx = None
+    # Для align/diarize подготовим аудио в формате WhisperX
+    audio_wx = None; wx = None
     if (align and segments_raw) or diarize:
         _, wx, _ = _lazy_imports()
         audio_wx = wx.load_audio(audio_path)
