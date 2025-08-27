@@ -1,7 +1,7 @@
 # /src/handler.py
-# Pro-mode: faster-whisper (ASR with full decoder control) + WhisperX alignment (word/char)
+# faster-whisper (ASR) + WhisperX align + постпроцесс для таймингов
 
-import os, json, base64, tempfile, time
+import os, json, base64, tempfile, time, re, difflib
 import runpod
 import requests
 
@@ -32,7 +32,7 @@ HF_TOKEN_ENV    = os.getenv("HF_TOKEN")
 HF_HOME         = os.getenv("HF_HOME", "/root/.cache/huggingface")
 WHISPER_CACHE   = os.getenv("WHISPER_CACHE", "/root/.cache/whisper")
 
-# allowed kwargs for faster-whisper .transcribe(...)
+# allowed kwargs для faster-whisper .transcribe(...)
 ALLOWED_FW_ARGS = {
     "beam_size","best_of","patience","length_penalty","temperature",
     "compression_ratio_threshold","log_prob_threshold","no_speech_threshold",
@@ -89,7 +89,6 @@ def _download_to_tmp(p):
     raise ValueError("Provide 'audio_url' or 'audio_b64' or 'audio_path'.")
 
 def _ensure_fw_model(model_name, compute_type):
-    """Init faster-whisper WhisperModel once per worker with desired compute_type/device."""
     global _fw_model, _fw_cfg
     _, _, FW = _lazy_imports()
     dev = _device()
@@ -106,7 +105,6 @@ def _ensure_fw_model(model_name, compute_type):
     return _fw_model
 
 def _ensure_aligner(lang_code, model_name=None):
-    """Init wav2vec2 aligner for given language (RU→ jonatasgrosman/...russian)."""
     global _align_model, _align_meta, _align_cfg
     _, wx, _ = _lazy_imports()
     dev = _device()
@@ -154,6 +152,60 @@ def _log_versions_once():
         print(f"[versions] torch=? err={e}")
     os.environ["VER_LOGGED"] = "1"
 
+# -------- постпроцесс таймингов --------
+def _norm_text(t: str) -> str:
+    return re.sub(r'[\s\W]+', ' ', (t or '')).strip().lower()
+
+def _snap_to_confident_words(seg, min_score=0.75):
+    ws = seg.get("words") or []
+    good = [w for w in ws if w.get("score", 1.0) >= min_score]
+    if good:
+        seg["start"] = float(good[0]["start"])
+        seg["end"]   = float(good[-1]["end"])
+    return seg
+
+def _limit_long_words(segments, max_word_dur=1.2):
+    for seg in segments:
+        ws = seg.get("words") or []
+        for i, w in enumerate(ws):
+            s = float(w["start"]); e = float(w["end"])
+            if e - s > max_word_dur:
+                e_new = s + max_word_dur
+                w["end"] = e_new
+                # не даём следующему слову пересекать насильно подрезанный хвост
+                if i + 1 < len(ws) and float(ws[i+1]["start"]) < e_new:
+                    ws[i+1]["start"] = e_new
+        if ws:
+            seg["start"] = float(ws[0]["start"])
+            seg["end"]   = float(ws[-1]["end"])
+    return segments
+
+def _split_segments_by_gaps(segments, gap=0.60):
+    out = []
+    for seg in segments:
+        ws = seg.get("words") or []
+        if not ws:
+            out.append(seg); continue
+        cur = [ws[0]]
+        for p, w in zip(ws, ws[1:]):
+            if float(w["start"]) - float(p["end"]) > gap:
+                out.append({
+                    "start": float(cur[0]["start"]),
+                    "end":   float(cur[-1]["end"]),
+                    "text":  " ".join(x["word"] for x in cur).strip(),
+                    "words": cur
+                })
+                cur = [w]
+            else:
+                cur.append(w)
+        out.append({
+            "start": float(cur[0]["start"]),
+            "end":   float(cur[-1]["end"]),
+            "text":  " ".join(x["word"] for x in cur).strip(),
+            "words": cur
+        })
+    return out
+
 # -------- main handler --------
 def handler(job):
     _log_versions_once()
@@ -162,36 +214,40 @@ def handler(job):
     p = job.get("input", {})
 
     model_name   = p.get("model", DEFAULT_MODEL)
-    # batch_size есть в API, но в FW .transcribe не используется
-    batch_size   = int(p.get("batch_size", DEFAULT_BATCH))
+    batch_size   = int(p.get("batch_size", DEFAULT_BATCH))  # (зарезервировано)
     compute_type = p.get("compute_type", DEFAULT_COMPUTE)
 
-    language     = p.get("language")           # "ru" и т.п.
+    language     = p.get("language")
     align        = bool(p.get("align", True))
     char_align   = bool(p.get("char_align", False))
     diarize      = bool(p.get("diarize", False))
     hf_token     = p.get("hf_token") or HF_TOKEN_ENV
 
-    align_model_name = p.get("align_model")    # явный HF aligner (опц.)
+    align_model_name = p.get("align_model")
     return_raw  = bool(p.get("return_raw", True))
     return_srt  = bool(p.get("return_srt", True))
     return_vtt  = bool(p.get("return_vtt", False))
 
-    # faster-whisper kwargs (полный контроль декодера) — БЕЗ batch_size
+    # параметры постпроцесса (можно задать через input.postprocess)
+    pp = p.get("postprocess", {}) or {}
+    PP_SNAP = float(pp.get("snap_min_score", 0.75))
+    PP_MAXW = float(pp.get("max_word_dur", 1.2))
+    PP_GAP  = float(pp.get("gap_split", 0.60))
+
+    # faster-whisper kwargs — БЕЗ batch_size
     fw_over = p.get("whisper", {}) or {}
     fw_kwargs = {}
     for k, v in fw_over.items():
         if k in ALLOWED_FW_ARGS:
             fw_kwargs[k] = v
 
-    # 1) Аудио (FW умеет принимать путь)
+    # 1) Аудио (FW принимает путь)
     audio_path = _download_to_tmp(p)
 
-    # 2) ASR: faster-whisper напрямую
+    # 2) ASR
     fw = _ensure_fw_model(model_name, compute_type)
     segments_iter, info = fw.transcribe(audio_path, language=language, **fw_kwargs)
 
-    # 2.1) normalize → список
     segments_raw = []
     for s in segments_iter:
         segments_raw.append({
@@ -203,13 +259,13 @@ def handler(job):
 
     detected_lang = info.language or language
 
-    # Для align/diarize подготовим аудио в формате WhisperX
+    # для align/diarize подготовим аудио
     audio_wx = None; wx = None
     if (align and segments_raw) or diarize:
         _, wx, _ = _lazy_imports()
         audio_wx = wx.load_audio(audio_path)
 
-    # 3) Alignment (wav2vec2)
+    # 3) Alignment
     segments_aligned = segments_raw
     diarize_segments = None
     if align and segments_raw:
@@ -219,7 +275,12 @@ def handler(job):
                            return_char_alignments=char_align)
         segments_aligned = aligned.get("segments", aligned)
 
-    # 4) (Optional) diarization
+        # ✂️ постпроцесс
+        segments_aligned = [_snap_to_confident_words(s, PP_SNAP) for s in segments_aligned]
+        segments_aligned = _limit_long_words(segments_aligned, max_word_dur=PP_MAXW)
+        segments_aligned = _split_segments_by_gaps(segments_aligned, gap=PP_GAP)
+
+    # 4) Диаризация (опционально)
     if diarize:
         if not hf_token:
             raise ValueError("Diarization requested but no HF token provided (env HF_TOKEN or input.hf_token)")
@@ -229,7 +290,6 @@ def handler(job):
                                 max_speakers=p.get("max_speakers"))
         segments_aligned = wx.assign_word_speakers(diarize_segments, {"segments": segments_aligned})["segments"]
 
-    # 5) build output
     out = {
         "device": _device(),
         "model": model_name,
@@ -254,5 +314,4 @@ def handler(job):
 
     return out
 
-# -------- runpod entry --------
 runpod.serverless.start({"handler": handler})
