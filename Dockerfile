@@ -16,6 +16,10 @@ RUN python3 -m pip install --upgrade pip
 
 # ✅ Torch/Torchaudio >= 2.5 (ставим сразу 2.8.x; колёса подтянут nvidia-cu12 зависимости)
 RUN pip install --no-cache-dir "torch==2.8.*" "torchaudio==2.8.*"
+# ставим cuDNN 8 как wheel (кладёт so.8 в site-packages)
+RUN pip install --no-cache-dir "nvidia-cudnn-cu11==8.9.*"
+# добавим путь к so.8 в LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # faster-whisper + CTranslate2 (GPU)
 RUN pip install --no-cache-dir "ctranslate2>=4.4,<5" "faster-whisper>=1.0,<2"
