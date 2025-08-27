@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir 'ctranslate2>=4.4,<5' 'faster-whisper>=1.0,<2'
 RUN pip install --no-cache-dir whisperx==3.4.2 runpod==1.7.13 requests srt numpy
 
 # Предзагрузка весов в слой образа (ускоряет cold start)
-RUN python3 - <<'PY'\nfrom faster_whisper import WhisperModel\nWhisperModel(\"large-v3\", device=\"cpu\", compute_type=\"int8\")\nPY
-RUN python3 - <<'PY'\nimport whisperx\nm, meta = whisperx.load_align_model(language_code=\"ru\", device=\"cpu\", model_name=None)\nPY
+RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
+RUN python3 -c "import whisperx; whisperx.load_align_model(language_code='ru', device='cpu', model_name=None)"
 
 WORKDIR /src
 COPY handler.py /src/handler.py
