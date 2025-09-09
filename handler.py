@@ -1,7 +1,7 @@
 # /src/handler.py
 # faster-whisper (ASR) + WhisperX align + постпроцесс для таймингов
 
-import os, json, base64, tempfile, time, re, difflib
+import os, json, base64, tempfile, time, re
 import runpod
 import requests
 
@@ -51,6 +51,8 @@ _fw_cfg   = {}      # {'name','ctype','device'}
 _align_model = None
 _align_meta  = None
 _align_cfg   = {}   # {'lang','model_name'}
+_PUNCT_TRAIL = r"\.\,\!\?\:\;\)\]\»”…"
+_PUNCT_LEAD  = r"\(\[\«“"
 
 # -------- helpers --------
 def _device():
@@ -180,6 +182,59 @@ def _limit_long_words(segments, max_word_dur=1.2):
             seg["end"]   = float(ws[-1]["end"])
     return segments
 
+def _round_and_fix(segments, nd=3, eps=0.001, min_word_dur=0.06):
+    def r(x): return round(float(x or 0.0), nd)
+    for s in segments:
+        ws = s.get("words") or []
+        # round words
+        for w in ws:
+            w["start"] = r(w.get("start"))
+            w["end"]   = r(w.get("end"))
+        # enforce monotonic after rounding
+        if ws:
+            last_end = ws[0]["start"] - eps
+            for w in ws:
+                if w["start"] < last_end + eps:
+                    w["start"] = last_end + eps
+                if w["end"] <= w["start"] + min_word_dur:
+                    w["end"] = w["start"] + min_word_dur
+                last_end = w["end"]
+            s["start"] = ws[0]["start"]
+            s["end"]   = ws[-1]["end"]
+        # round segment bounds too
+        s["start"] = r(s.get("start"))
+        s["end"]   = r(s.get("end"))
+    return segments
+
+def _deoverlap_words(segments, eps=0.02, min_word_dur=0.06, pad=0.0):
+    for seg in segments:
+        ws = seg.get("words") or []
+        if not ws:
+            continue
+        last_end = float(ws[0]["start"]) - eps
+        for w in ws:
+            s = float(w["start"]); e = float(w["end"])
+            if s < last_end + eps:
+                s = last_end + eps                  # сдвинуть старт вперёд
+            if e <= s + min_word_dur:
+                e = s + min_word_dur               # обеспечить минимальную длительность
+            w["start"] = s; w["end"] = e
+            last_end = e + pad
+        seg["start"] = float(ws[0]["start"])
+        seg["end"]   = float(ws[-1]["end"])
+    return segments
+
+
+
+def _join_words(words):
+    t = " ".join(x["word"] for x in words)
+    t = re.sub(rf"\s+([{_PUNCT_TRAIL}])", r"\1", t)  # пробелы перед .,!?:;… и закрывающими
+    t = re.sub(rf"([{_PUNCT_LEAD}])\s+", r"\1", t)   # пробелы после открывающих «“([ 
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+
 def _split_segments_by_gaps(segments, gap=0.60):
     out = []
     for seg in segments:
@@ -192,7 +247,7 @@ def _split_segments_by_gaps(segments, gap=0.60):
                 out.append({
                     "start": float(cur[0]["start"]),
                     "end":   float(cur[-1]["end"]),
-                    "text":  " ".join(x["word"] for x in cur).strip(),
+                    "text": _join_words(cur),
                     "words": cur
                 })
                 cur = [w]
@@ -201,7 +256,7 @@ def _split_segments_by_gaps(segments, gap=0.60):
         out.append({
             "start": float(cur[0]["start"]),
             "end":   float(cur[-1]["end"]),
-            "text":  " ".join(x["word"] for x in cur).strip(),
+            "text":  _join_words(cur),
             "words": cur
         })
     return out
@@ -233,6 +288,9 @@ def handler(job):
     PP_SNAP = float(pp.get("snap_min_score", 0.75))
     PP_MAXW = float(pp.get("max_word_dur", 1.2))
     PP_GAP  = float(pp.get("gap_split", 0.60))
+    PP_DEOVERLAP = float(pp.get("deoverlap_eps", 0.02))
+    PP_MINW_FLOOR = float(pp.get("min_word_dur_floor", 0.06))
+    PP_PAD = float(pp.get("overlap_pad", 0.0))
 
     # faster-whisper kwargs — БЕЗ batch_size
     fw_over = p.get("whisper", {}) or {}
@@ -275,10 +333,15 @@ def handler(job):
                            return_char_alignments=char_align)
         segments_aligned = aligned.get("segments", aligned)
 
-        # ✂️ постпроцесс
-        segments_aligned = [_snap_to_confident_words(s, PP_SNAP) for s in segments_aligned]
-        segments_aligned = _limit_long_words(segments_aligned, max_word_dur=PP_MAXW)
-        segments_aligned = _split_segments_by_gaps(segments_aligned, gap=PP_GAP)
+        # ✂️ постпроцесс (нормализуем слова, потом режем)
+        segments_aligned = _round_and_fix(
+            segments_aligned,
+            nd=3,
+            eps=max(0.001, PP_DEOVERLAP/2),
+                    min_word_dur=PP_MINW_FLOOR
+        )
+
+
 
     # 4) Диаризация (опционально)
     if diarize:
@@ -289,7 +352,12 @@ def handler(job):
                                 min_speakers=p.get("min_speakers"),
                                 max_speakers=p.get("max_speakers"))
         segments_aligned = wx.assign_word_speakers(diarize_segments, {"segments": segments_aligned})["segments"]
-
+    segments_aligned = _round_and_fix(
+        segments_aligned,
+        nd=3,
+        eps=max(0.001, PP_DEOVERLAP/2),
+        min_word_dur=PP_MINW_FLOOR
+    )
     out = {
         "device": _device(),
         "model": model_name,
