@@ -266,7 +266,7 @@ def handler(job):
     _log_versions_once()
 
     t0 = time.time()
-    p = job.get("input", {})
+    p = job.get("input", {}) or {}
 
     model_name   = p.get("model", DEFAULT_MODEL)
     batch_size   = int(p.get("batch_size", DEFAULT_BATCH))  # (зарезервировано)
@@ -283,21 +283,19 @@ def handler(job):
     return_srt  = bool(p.get("return_srt", True))
     return_vtt  = bool(p.get("return_vtt", False))
 
-    # параметры постпроцесса (можно задать через input.postprocess)
+    # --- постпроцесс (всегда передаёшь сам) ---
     pp = p.get("postprocess", {}) or {}
-    PP_SNAP = float(pp.get("snap_min_score", 0.75))
-    PP_MAXW = float(pp.get("max_word_dur", 1.2))
-    PP_GAP  = float(pp.get("gap_split", 0.60))
-    PP_DEOVERLAP = float(pp.get("deoverlap_eps", 0.02))
-    PP_MINW_FLOOR = float(pp.get("min_word_dur_floor", 0.06))
-    PP_PAD = float(pp.get("overlap_pad", 0.0))
+    PP_SNAP  = float(pp.get("snap_min_score", 0.75))
+    PP_MAXW  = float(pp.get("max_word_dur", 1.2))
+    _raw_gap = pp.get("gap_split")                  # важный момент: None -> не резать
+    PP_GAP   = None if _raw_gap is None else float(_raw_gap)
+    PP_DEOVERLAP   = float(pp.get("deoverlap_eps", 0.02))
+    PP_MINW_FLOOR  = float(pp.get("min_word_dur_floor", 0.06))
+    PP_PAD         = float(pp.get("overlap_pad", 0.0))
 
-    # faster-whisper kwargs — БЕЗ batch_size
+    # --- faster-whisper kwargs — БЕЗ batch_size ---
     fw_over = p.get("whisper", {}) or {}
-    fw_kwargs = {}
-    for k, v in fw_over.items():
-        if k in ALLOWED_FW_ARGS:
-            fw_kwargs[k] = v
+    fw_kwargs = {k: v for k, v in fw_over.items() if k in ALLOWED_FW_ARGS}
 
     # 1) Аудио (FW принимает путь)
     audio_path = _download_to_tmp(p)
@@ -317,47 +315,89 @@ def handler(job):
 
     detected_lang = info.language or language
 
-    # для align/diarize подготовим аудио
+    # 3) Alignment (и подготовка аудио)
     audio_wx = None; wx = None
+    segments_aligned = segments_raw
+    diarize_segments = None
+
     if (align and segments_raw) or diarize:
         _, wx, _ = _lazy_imports()
         audio_wx = wx.load_audio(audio_path)
 
-    # 3) Alignment
-    segments_aligned = segments_raw
-    diarize_segments = None
     if align and segments_raw:
         lang = (language or detected_lang or "ru")
         align_model, meta = _ensure_aligner(lang, model_name=align_model_name)
-        aligned = wx.align(segments_raw, align_model, meta, audio_wx, _device(),
-                           return_char_alignments=char_align)
+        aligned = wx.align(
+            segments_raw, align_model, meta, audio_wx, _device(),
+            return_char_alignments=char_align
+        )
         segments_aligned = aligned.get("segments", aligned)
 
-        # ✂️ постпроцесс (нормализуем слова, потом режем)
-        segments_aligned = _round_and_fix(
+        # 3.1) поджать края по уверенным словам
+        segments_aligned = [_snap_to_confident_words(s, PP_SNAP) for s in segments_aligned]
+
+        # 3.2) ограничить длительность слова и убрать наезды
+        segments_aligned = _limit_long_words(segments_aligned, max_word_dur=PP_MAXW)
+        segments_aligned = _deoverlap_words(
             segments_aligned,
-            nd=3,
-            eps=max(0.001, PP_DEOVERLAP/2),
-                    min_word_dur=PP_MINW_FLOOR
+            eps=PP_DEOVERLAP,
+            min_word_dur=PP_MINW_FLOOR,
+            pad=PP_PAD
         )
 
-
+        # 3.3) режем по запросу
+        if PP_GAP is not None:
+            if PP_GAP > 0:
+                # режим "фразы между паузами"
+                segments_aligned = _split_segments_by_gaps(segments_aligned, gap=PP_GAP)
+            else:
+                # PP_GAP == 0.0 → режим "по словам": взрываем в сегменты-слова
+                exploded = []
+                next_id = 0
+                for seg in segments_aligned:
+                    ws = seg.get("words") or []
+                    if not ws:
+                        # если слов нет — оставим как есть
+                        seg = dict(seg)
+                        seg["id"] = next_id; next_id += 1
+                        exploded.append(seg)
+                        continue
+                    for w in ws:
+                        exploded.append({
+                            "id": next_id,
+                            "start": float(w.get("start", 0.0)),
+                            "end":   float(w.get("end",   0.0)),
+                            "text":  (w.get("word") or "").strip(),
+                            "words": [{
+                                "word":  (w.get("word") or "").strip(),
+                                "start": float(w.get("start", 0.0)),
+                                "end":   float(w.get("end",   0.0)),
+                                "score": float(w.get("score", 1.0)),
+                            }],
+                        })
+                        next_id += 1
+                segments_aligned = exploded
 
     # 4) Диаризация (опционально)
     if diarize:
         if not hf_token:
             raise ValueError("Diarization requested but no HF token provided (env HF_TOKEN or input.hf_token)")
         diar = wx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=_device())
-        diarize_segments = diar(audio_wx,
-                                min_speakers=p.get("min_speakers"),
-                                max_speakers=p.get("max_speakers"))
+        diarize_segments = diar(
+            audio_wx,
+            min_speakers=p.get("min_speakers"),
+            max_speakers=p.get("max_speakers")
+        )
         segments_aligned = wx.assign_word_speakers(diarize_segments, {"segments": segments_aligned})["segments"]
+
+    # 5) финальный фикс/округление (один раз, в самом конце)
     segments_aligned = _round_and_fix(
         segments_aligned,
         nd=3,
-        eps=max(0.001, PP_DEOVERLAP/2),
+        eps=max(0.001, PP_DEOVERLAP / 2),
         min_word_dur=PP_MINW_FLOOR
     )
+
     out = {
         "device": _device(),
         "model": model_name,
